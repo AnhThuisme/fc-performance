@@ -22,6 +22,7 @@ from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse, JSONResponse
 import uvicorn
 import gspread
+from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from social_selenium import create_selenium_driver, close_selenium_driver, fetch_social_stats
@@ -43,6 +44,8 @@ def runtime_file_path(filename: str) -> str:
 # ==========================================
 SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", 'credential.json')
 AUTH_SETTINGS_FILE = os.getenv("AUTH_SETTINGS_FILE", runtime_file_path("auth_settings.json"))
+PROJECT_CONFIG_FILE = os.getenv("PROJECT_CONFIG_FILE", "config.json")
+AUTH_SETTINGS_WORKSHEET_NAME = str(os.getenv("AUTH_SETTINGS_WORKSHEET_NAME", "__auth_settings") or "__auth_settings").strip() or "__auth_settings"
 SESSION_COOKIE_NAME = "social_monitor_session"
 OTP_LENGTH = 6
 OTP_REQUEST_COOLDOWN_SECONDS = 30
@@ -128,6 +131,7 @@ WEEKDAY_NAMES = [
 last_schedule_run_key = ""
 scheduler_thread = None
 scheduler_stop_event = threading.Event()
+PROJECT_CONFIG_CACHE = None
 
 def normalize_email_address(value: str) -> str:
     return (value or "").strip().lower()
@@ -166,6 +170,49 @@ def parse_bool_env(value: str, default: bool) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def coerce_sheet_id(raw_value: str) -> str:
+    candidate = str(raw_value or "").strip()
+    if not candidate:
+        return ""
+    m = re.search(r"/spreadsheets/(?:u/\d+/)?d/([a-zA-Z0-9-_]+)", candidate)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"[a-zA-Z0-9-_]{20,}", candidate):
+        return candidate
+    return ""
+
+
+def load_project_config():
+    global PROJECT_CONFIG_CACHE
+    if isinstance(PROJECT_CONFIG_CACHE, dict):
+        return PROJECT_CONFIG_CACHE
+    data = {}
+    if os.path.exists(PROJECT_CONFIG_FILE):
+        try:
+            with open(PROJECT_CONFIG_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                data = raw
+        except Exception:
+            data = {}
+    PROJECT_CONFIG_CACHE = data
+    return PROJECT_CONFIG_CACHE
+
+
+def get_auth_settings_sheet_id() -> str:
+    candidates = [
+        os.getenv("AUTH_SETTINGS_SHEET_ID", ""),
+        DEFAULT_SHEET_ID,
+        load_project_config().get("sheet_id", ""),
+        ACTIVE_SHEET_ID,
+    ]
+    for candidate in candidates:
+        sheet_id = coerce_sheet_id(candidate)
+        if sheet_id:
+            return sheet_id
+    return ""
 
 def build_default_auth_settings():
     return {
@@ -280,22 +327,88 @@ def normalize_auth_settings(data):
     settings["session_secret"] = str(settings.get("session_secret", "") or "").strip() or secrets.token_hex(32)
     return settings
 
-def save_auth_settings(settings):
+def get_auth_settings_worksheet(create_if_missing: bool = False):
+    sheet_id = get_auth_settings_sheet_id()
+    if not sheet_id:
+        return None
+    gc = get_gspread_client()
+    spreadsheet = gc.open_by_key(sheet_id)
+    try:
+        return spreadsheet.worksheet(AUTH_SETTINGS_WORKSHEET_NAME)
+    except WorksheetNotFound:
+        if not create_if_missing:
+            return None
+        return spreadsheet.add_worksheet(title=AUTH_SETTINGS_WORKSHEET_NAME, rows=10, cols=2)
+
+
+def load_auth_settings_from_remote():
+    worksheet = get_auth_settings_worksheet(create_if_missing=False)
+    if not worksheet:
+        return None
+    raw_value = str(worksheet.acell("A1").value or "").strip()
+    if not raw_value:
+        return None
+    return json.loads(raw_value)
+
+
+def save_auth_settings_to_remote(settings):
+    worksheet = get_auth_settings_worksheet(create_if_missing=True)
+    if not worksheet:
+        return False
+    payload = json.dumps(normalize_auth_settings(settings), ensure_ascii=False, separators=(",", ":"))
+    worksheet.update_acell("A1", payload)
+    worksheet.update_acell("A2", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    return True
+
+
+def save_auth_settings_to_file(settings):
     with open(AUTH_SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(normalize_auth_settings(settings), f, ensure_ascii=False, indent=2)
 
-def load_auth_settings():
+
+def load_auth_settings_from_file():
     if os.path.exists(AUTH_SETTINGS_FILE):
         try:
             with open(AUTH_SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                return json.load(f)
         except Exception:
-            data = {}
-    else:
-        data = {}
+            return {}
+    return {}
+
+
+def save_auth_settings(settings):
+    normalized = normalize_auth_settings(settings)
+    remote_error = None
+    try:
+        if get_auth_settings_sheet_id():
+            save_auth_settings_to_remote(normalized)
+    except Exception as exc:
+        remote_error = exc
+    save_auth_settings_to_file(normalized)
+    if remote_error and is_serverless_runtime():
+        raise remote_error
+
+
+def load_auth_settings():
+    try:
+        remote_data = load_auth_settings_from_remote()
+    except Exception:
+        remote_data = None
+    if isinstance(remote_data, dict):
+        settings = normalize_auth_settings(remote_data)
+        try:
+            save_auth_settings_to_file(settings)
+        except Exception:
+            pass
+        return settings
+
+    data = load_auth_settings_from_file()
     settings = normalize_auth_settings(data)
     if not os.path.exists(AUTH_SETTINGS_FILE):
-        save_auth_settings(settings)
+        try:
+            save_auth_settings(settings)
+        except Exception:
+            save_auth_settings_to_file(settings)
     return settings
 
 def persist_auth_settings(settings):
