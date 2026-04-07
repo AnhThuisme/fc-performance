@@ -9,6 +9,7 @@ import hashlib
 import secrets
 import smtplib
 import ssl
+import tempfile
 import threading
 import unicodedata
 import requests
@@ -27,11 +28,21 @@ from social_selenium import create_selenium_driver, close_selenium_driver, fetch
 
 app = FastAPI()
 
+
+def is_serverless_runtime() -> bool:
+    return bool((os.getenv("VERCEL", "") or os.getenv("VERCEL_ENV", "")).strip())
+
+
+def runtime_file_path(filename: str) -> str:
+    if is_serverless_runtime():
+        return os.path.join(tempfile.gettempdir(), filename)
+    return filename
+
 # ==========================================
 # Cáº¤U HÃŒNH THÃ”NG Sá»
 # ==========================================
-SERVICE_ACCOUNT_FILE = 'credential.json'
-AUTH_SETTINGS_FILE = "auth_settings.json"
+SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", 'credential.json')
+AUTH_SETTINGS_FILE = os.getenv("AUTH_SETTINGS_FILE", runtime_file_path("auth_settings.json"))
 SESSION_COOKIE_NAME = "social_monitor_session"
 OTP_LENGTH = 6
 OTP_REQUEST_COOLDOWN_SECONDS = 30
@@ -1817,10 +1828,21 @@ def ensure_scheduler_thread():
     scheduler_thread.start()
 
 def get_gspread_client():
-    creds = Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    )
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    service_account_json = str(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "") or "").strip()
+    if service_account_json:
+        try:
+            service_account_info = json.loads(service_account_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.") from exc
+        creds = Credentials.from_service_account_info(service_account_info, scopes=scopes)
+    else:
+        if not os.path.exists(SERVICE_ACCOUNT_FILE):
+            raise RuntimeError(
+                "Google service account credentials are missing. "
+                "Set GOOGLE_SERVICE_ACCOUNT_JSON or provide credential.json."
+            )
+        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
     return gspread.authorize(creds)
 
 def extract_sheet_id(sheet_input: str) -> Optional[str]:
@@ -3128,7 +3150,8 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
 # --- API & UI ---
 @app.on_event("startup")
 def on_startup():
-    ensure_scheduler_thread()
+    if not is_serverless_runtime():
+        ensure_scheduler_thread()
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
@@ -3638,7 +3661,7 @@ def download_excel(request: Request):
         sheet = get_worksheet(ACTIVE_SHEET_NAME)
         records, _, _ = get_sheet_records(sheet)
         df = pd.DataFrame(records)
-        path = "Social_Export.xlsx"
+        path = runtime_file_path("Social_Export.xlsx")
         df.to_excel(path, index=False, engine="openpyxl")
         safe_sheet_name = re.sub(r"[^A-Za-z0-9_-]+", "_", ACTIVE_SHEET_NAME).strip("_") or "sheet"
         return FileResponse(path, filename=f"Data_{safe_sheet_name}_{datetime.now().strftime('%H%M')}.xlsx")
@@ -3659,7 +3682,7 @@ def download_excel_all(request: Request):
     try:
         gc = get_gspread_client()
         spreadsheet = gc.open_by_key(ACTIVE_SHEET_ID)
-        path = "Social_Export_All.xlsx"
+        path = runtime_file_path("Social_Export_All.xlsx")
         with pd.ExcelWriter(path, engine="openpyxl") as writer:
             for ws in spreadsheet.worksheets():
                 records, _, _ = get_sheet_records(ws)
