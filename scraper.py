@@ -1830,6 +1830,12 @@ def ensure_scheduler_thread():
 def get_gspread_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     service_account_json = str(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "") or "").strip()
+    service_account_json_base64 = str(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "") or "").strip()
+    if (not service_account_json) and service_account_json_base64:
+        try:
+            service_account_json = base64.b64decode(service_account_json_base64).decode("utf-8")
+        except Exception as exc:
+            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 is not valid base64 JSON.") from exc
     if service_account_json:
         try:
             service_account_info = json.loads(service_account_json)
@@ -1840,7 +1846,7 @@ def get_gspread_client():
         if not os.path.exists(SERVICE_ACCOUNT_FILE):
             raise RuntimeError(
                 "Google service account credentials are missing. "
-                "Set GOOGLE_SERVICE_ACCOUNT_JSON or provide credential.json."
+                "Set GOOGLE_SERVICE_ACCOUNT_JSON, GOOGLE_SERVICE_ACCOUNT_JSON_BASE64, or provide credential.json."
             )
         creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
     return gspread.authorize(creds)
