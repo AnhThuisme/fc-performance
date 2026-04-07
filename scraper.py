@@ -3126,6 +3126,7 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
     global schedule_last_run_processed, schedule_last_run_success, schedule_last_run_failed
     social_driver = None
     social_driver_failed = False
+    social_driver_error_message = ""
     started_at = datetime.now()
     run_started_at = started_at
     run_source = (source or "manual").strip().lower() or "manual"
@@ -3218,7 +3219,8 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                             social_driver = create_selenium_driver(logger=add_log)
                         except Exception as driver_error:
                             social_driver_failed = True
-                            add_log(str(driver_error))
+                            social_driver_error_message = str(driver_error)
+                            add_log(social_driver_error_message)
                     stats = None if social_driver_failed else get_social_stats(url, platform, driver=social_driver)
                 if stats and "v" not in stats and is_optional_view_metric(url, platform):
                     stats = dict(stats)
@@ -3239,7 +3241,10 @@ def run_scraper_logic(sheet_id: Optional[str] = None, sheet_name: Optional[str] 
                     success_count += 1
                 elif is_running:
                     update_metric_highlights(sheet, i, col_map, get_missing_metric_fields(col_map, None))
-                    add_log(f"Dòng {i}: Không lấy được số liệu")
+                    if social_driver_failed and platform != "YouTube" and social_driver_error_message:
+                        add_log(f"Dòng {i}: Bỏ qua vì Selenium chưa sẵn sàng trên môi trường này")
+                    else:
+                        add_log(f"Dòng {i}: Không lấy được số liệu")
                     failed_count += 1
                 time.sleep(max(0.0, ROW_SCAN_DELAY_SECONDS))
         pending_updates = []

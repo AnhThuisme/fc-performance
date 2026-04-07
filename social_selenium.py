@@ -1,3 +1,4 @@
+import os
 import json
 import re
 import time
@@ -17,6 +18,18 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/136.0.0.0 Safari/537.36"
 )
+
+
+def _is_serverless_runtime() -> bool:
+    return bool((os.getenv("VERCEL", "") or os.getenv("VERCEL_ENV", "")).strip())
+
+
+def _get_remote_webdriver_url() -> str:
+    for env_name in ("SELENIUM_REMOTE_URL", "WEBDRIVER_REMOTE_URL"):
+        value = str(os.getenv(env_name, "") or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _emit(logger: Optional[Callable[[str], None]], message: str):
@@ -79,11 +92,49 @@ def _build_edge_driver(headless: bool = True):
     return driver
 
 
+def _build_remote_driver(headless: bool = True, preferred_browser: str = ""):
+    remote_url = _get_remote_webdriver_url()
+    if not remote_url:
+        raise RuntimeError("Missing remote webdriver URL.")
+
+    browser_name = (preferred_browser or os.getenv("SELENIUM_REMOTE_BROWSER", "chrome")).strip().lower()
+    if browser_name == "edge":
+        options = EdgeOptions()
+    else:
+        browser_name = "chrome"
+        options = ChromeOptions()
+        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("useAutomationExtension", False)
+
+    _add_common_browser_args(options, headless=headless)
+    driver = webdriver.Remote(command_executor=remote_url, options=options)
+    driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+    _apply_stealth(driver)
+    return driver
+
+
 def create_selenium_driver(
     logger: Optional[Callable[[str], None]] = None,
     headless: bool = True,
     preferred_browser: str = "",
 ):
+    remote_url = _get_remote_webdriver_url()
+    if remote_url:
+        try:
+            driver = _build_remote_driver(headless=headless, preferred_browser=preferred_browser)
+            mode = "headless" if headless else "thuong"
+            _emit(logger, f"Selenium dang dung remote browser ({mode})")
+            return driver
+        except Exception as exc:
+            raise RuntimeError(f"Khong ket noi duoc remote Selenium: {str(exc)[:220]}") from exc
+
+    if _is_serverless_runtime():
+        raise RuntimeError(
+            "Runtime nay khong co Chrome/Edge driver cho Selenium. "
+            "Tren Vercel, hay cau hinh SELENIUM_REMOTE_URL de noi toi browser tu xa, "
+            "hoac chay app tren VPS/may tinh co trinh duyet."
+        )
+
     errors = []
     builders = [("Chrome", _build_chrome_driver), ("Edge", _build_edge_driver)]
     preferred = (preferred_browser or "").strip().lower()
