@@ -1832,10 +1832,22 @@ def get_gspread_client():
     service_account_json = str(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "") or "").strip()
     service_account_json_base64 = str(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64", "") or "").strip()
     if (not service_account_json) and service_account_json_base64:
-        try:
-            service_account_json = base64.b64decode(service_account_json_base64).decode("utf-8")
-        except Exception as exc:
-            raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 is not valid base64 JSON.") from exc
+        normalized_base64 = service_account_json_base64.strip().strip("'").strip('"')
+        if normalized_base64.startswith("{"):
+            service_account_json = normalized_base64
+        else:
+            normalized_base64 += "=" * (-len(normalized_base64) % 4)
+            decoded_payload = None
+            decode_error = None
+            for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+                try:
+                    decoded_payload = decoder(normalized_base64).decode("utf-8-sig")
+                    break
+                except Exception as exc:
+                    decode_error = exc
+            if decoded_payload is None:
+                raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 is not valid base64 JSON.") from decode_error
+            service_account_json = decoded_payload
     if service_account_json:
         try:
             service_account_info = json.loads(service_account_json)
