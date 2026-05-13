@@ -74,6 +74,14 @@ def _get_sidebar_mascot_data_uri() -> str:
     return _SIDEBAR_MASCOT_DATA_URI
 
 
+def runtime_file_path(filename: str) -> str:
+    if os.getenv("VERCEL", "").strip() or os.getenv("VERCEL_ENV", "").strip() or os.getenv("AWS_LAMBDA_FUNCTION_NAME", "").strip():
+        return os.path.join(tempfile.gettempdir(), filename)
+    if os.access(".", os.W_OK):
+        return filename
+    return os.path.join(tempfile.gettempdir(), filename)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_scheduler_thread()
@@ -94,8 +102,8 @@ DASHBOARD_SECTION_IDS = {
 # ==========================================
 # Cáº¤U HÃŒNH THÃ”NG Sá»
 # ==========================================
-SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", "credential.json").strip() or "credential.json"
-AUTH_SETTINGS_FILE = "auth_settings.json"
+SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", runtime_file_path("credential.json")).strip() or runtime_file_path("credential.json")
+AUTH_SETTINGS_FILE = os.getenv("AUTH_SETTINGS_FILE", runtime_file_path("auth_settings.json")).strip() or runtime_file_path("auth_settings.json")
 SESSION_COOKIE_NAME = "social_monitor_session"
 OTP_LENGTH = 6
 OTP_REQUEST_COOLDOWN_SECONDS = 30
@@ -113,6 +121,7 @@ def save_sheet_tabs_cache(cache_data):
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
 
 def load_sheet_tabs_cache():
     if os.path.exists(SHEET_TABS_CACHE_FILE):
@@ -155,10 +164,10 @@ def load_dashboard_cache():
             pass
     return {}
 
-SHEET_TABS_CACHE_FILE = "sheet_tabs_cache.json"
+SHEET_TABS_CACHE_FILE = os.getenv("SHEET_TABS_CACHE_FILE", runtime_file_path("sheet_tabs_cache.json")).strip() or runtime_file_path("sheet_tabs_cache.json")
 SHEET_TABS_CACHE = load_sheet_tabs_cache()
 SHEET_TABS_CACHE_TTL_SECONDS = 600  # Increased to 10 minutes
-SHEET_DATA_CACHE_FILE = "sheet_data_cache.json"
+SHEET_DATA_CACHE_FILE = os.getenv("SHEET_DATA_CACHE_FILE", runtime_file_path("sheet_data_cache.json")).strip() or runtime_file_path("sheet_data_cache.json")
 SHEET_DATA_CACHE = load_sheet_data_cache()  # Persistence for sheet.get_all_values()
 SHEET_DATA_CACHE_TTL_SECONDS = 300  # 5 minutes
 SHEET_COLUMN_CACHE = {}  # {sheet_id:sheet_name:col_idx -> {"updated_at": iso, "values": [...]}}
@@ -173,7 +182,7 @@ SPREADSHEET_OBJECT_CACHE_TTL_SECONDS = max(120, int(os.getenv("SPREADSHEET_OBJEC
 WORKSHEET_OBJECT_CACHE = {}  # {sheet_id:sheet_name -> {"updated_at": epoch, "worksheet": gspread.Worksheet}}
 WORKSHEET_OBJECT_CACHE_TTL_SECONDS = max(120, int(os.getenv("WORKSHEET_OBJECT_CACHE_TTL_SECONDS", "900")))
 WORKSHEET_OBJECT_CACHE_LOCK = threading.RLock()
-DASHBOARD_CACHE_FILE = "dashboard_cache.json"
+DASHBOARD_CACHE_FILE = os.getenv("DASHBOARD_CACHE_FILE", runtime_file_path("dashboard_cache.json")).strip() or runtime_file_path("dashboard_cache.json")
 DASHBOARD_CACHE = load_dashboard_cache()  # Memory cache mirrored by file
 DASHBOARD_CACHE_TTL_SECONDS = 300
 DASHBOARD_REFRESH_TTL_SECONDS = max(30, int(os.getenv("DASHBOARD_REFRESH_TTL_SECONDS", "120")))
@@ -670,8 +679,12 @@ def normalize_auth_settings(data):
     return settings
 
 def save_auth_settings(settings):
-    with open(AUTH_SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(normalize_auth_settings(settings), f, ensure_ascii=False, indent=2)
+    try:
+        with open(AUTH_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(normalize_auth_settings(settings), f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 
 def load_auth_settings():
     if os.path.exists(AUTH_SETTINGS_FILE):
