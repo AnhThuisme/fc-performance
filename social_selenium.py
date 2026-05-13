@@ -1,8 +1,12 @@
-import os
 import json
+import os
 import re
+import signal
+import subprocess
+import sys
 import time
 import urllib.parse
+from datetime import datetime
 from typing import Callable, Optional
 
 import requests
@@ -11,25 +15,60 @@ from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.chrome.options import Options as ChromeOptions
 from selenium.webdriver.edge.options import Options as EdgeOptions
 
-DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = 25
-DEFAULT_SETTLE_SECONDS = 2.2
+def _env_float(name: str, default: float, min_value: float) -> float:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+        return value if value >= min_value else default
+    except Exception:
+        return default
+
+
+DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_PAGE_LOAD_TIMEOUT_SECONDS", 20.0, 5.0)
+TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS", 16.0, 3.0)
+FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS", 18.0, 3.0)
+INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS = _env_float("SELENIUM_INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS", 10.0, 3.0)
+TIKTOK_SOFT_RETRY_ATTEMPTS = int(_env_float("SELENIUM_TIKTOK_SOFT_RETRY_ATTEMPTS", 1.0, 0.0))
+TIKTOK_SOFT_RETRY_DELAY_SECONDS = _env_float("SELENIUM_TIKTOK_SOFT_RETRY_DELAY_SECONDS", 1.0, 0.0)
+FACEBOOK_SOFT_RETRY_ATTEMPTS = int(_env_float("SELENIUM_FACEBOOK_SOFT_RETRY_ATTEMPTS", 1.0, 0.0))
+FACEBOOK_SOFT_RETRY_DELAY_SECONDS = _env_float("SELENIUM_FACEBOOK_SOFT_RETRY_DELAY_SECONDS", 1.0, 0.0)
+INSTAGRAM_SOFT_RETRY_ATTEMPTS = int(_env_float("SELENIUM_INSTAGRAM_SOFT_RETRY_ATTEMPTS", 1.0, 0.0))
+INSTAGRAM_SOFT_RETRY_DELAY_SECONDS = _env_float("SELENIUM_INSTAGRAM_SOFT_RETRY_DELAY_SECONDS", 1.0, 0.0)
+TIMEOUT_RECOVERY_RETRY_ATTEMPTS = int(_env_float("SELENIUM_TIMEOUT_RECOVERY_RETRY_ATTEMPTS", 1.0, 0.0))
+TIMEOUT_RECOVERY_RETRY_DELAY_SECONDS = _env_float("SELENIUM_TIMEOUT_RECOVERY_RETRY_DELAY_SECONDS", 0.8, 0.0)
+TIKTOK_TIMEOUT_STREAK_THRESHOLD = max(1, int(_env_float("SELENIUM_TIKTOK_TIMEOUT_STREAK_THRESHOLD", 2.0, 1.0)))
+TIKTOK_TIMEOUT_COOLDOWN_SECONDS = _env_float("SELENIUM_TIKTOK_TIMEOUT_COOLDOWN_SECONDS", 45.0, 5.0)
+DEFAULT_SETTLE_SECONDS = _env_float("SELENIUM_SETTLE_SECONDS", 1.7, 0.1)
+READY_POLL_SECONDS = _env_float("SELENIUM_READY_POLL_SECONDS", 0.25, 0.05)
+READY_TIMEOUT_SECONDS = _env_float("SELENIUM_READY_TIMEOUT_SECONDS", 8.0, 1.0)
+TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS = _env_float("TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS", 12.0, 5.0)
+TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS = _env_float("TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS", 0.8, 0.2)
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/136.0.0.0 Safari/537.36"
 )
+_FB_COOKIES_CACHE = None
+_FB_COOKIES_CACHE_KEY = None
+_TT_COOKIES_CACHE = None
+_TT_COOKIES_CACHE_KEY = None
+_IG_COOKIES_CACHE = None
+_IG_COOKIES_CACHE_KEY = None
+_TIKTOK_TIMEOUT_STREAK = 0
+_TIKTOK_TIMEOUT_COOLDOWN_UNTIL = 0.0
+LOCAL_STRICT_VISIBLE = str(os.getenv("SELENIUM_LOCAL_STRICT_VISIBLE", "1")).strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _is_serverless_runtime() -> bool:
-    return bool((os.getenv("VERCEL", "") or os.getenv("VERCEL_ENV", "")).strip())
-
-
-def _get_remote_webdriver_url() -> str:
-    for env_name in ("SELENIUM_REMOTE_URL", "WEBDRIVER_REMOTE_URL"):
-        value = str(os.getenv(env_name, "") or "").strip()
-        if value:
-            return value
-    return ""
+def _get_remote_selenium_url() -> str:
+    remote_url = (os.getenv("SELENIUM_REMOTE_URL") or "").strip()
+    if remote_url:
+        return remote_url
+    hub_url = (os.getenv("SELENIUM_HUB_URL") or "").strip()
+    if hub_url:
+        return hub_url
+    return (os.getenv("REMOTE_WEBDRIVER_URL") or "").strip()
 
 
 def _emit(logger: Optional[Callable[[str], None]], message: str):
@@ -39,6 +78,292 @@ def _emit(logger: Optional[Callable[[str], None]], message: str):
         logger(message)
     except Exception:
         pass
+
+
+def _is_local_desktop_runtime() -> bool:
+    return (
+        os.name == "nt"
+        or sys.platform == "darwin"
+        or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    )
+
+
+def reset_stale_selenium_sessions(logger: Optional[Callable[[str], None]] = None) -> tuple[bool, str]:
+    """
+    Best-effort cleanup for stale chromedriver processes before starting a new run.
+    Keeps action narrow (chromedriver only) to avoid killing user Chrome manually in use.
+    """
+    killed = 0
+    try:
+        if sys.platform == "darwin" or sys.platform.startswith("linux"):
+            proc = subprocess.run(["pgrep", "-f", "chromedriver"], capture_output=True, text=True)
+            pids = [int(x.strip()) for x in (proc.stdout or "").splitlines() if x.strip().isdigit()]
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    killed += 1
+                except Exception:
+                    pass
+        elif os.name == "nt":
+            proc = subprocess.run(["tasklist", "/FI", "IMAGENAME eq chromedriver.exe"], capture_output=True, text=True)
+            if "chromedriver.exe" in str(proc.stdout or "").lower():
+                subprocess.run(["taskkill", "/IM", "chromedriver.exe", "/F"], capture_output=True, text=True)
+                # taskkill by image does not return count reliably
+                killed = 1
+    except Exception as exc:
+        _emit(logger, f"[LOCAL-STABLE] Reset stale sessions thất bại: {str(exc)[:120]}")
+        return False, f"reset_failed:{exc}"
+    _emit(logger, f"[LOCAL-STABLE] Reset stale chromedriver: {killed} process")
+    return True, f"killed={killed}"
+
+
+def _load_fb_cookies_from_env(logger: Optional[Callable[[str], None]] = None):
+    global _FB_COOKIES_CACHE, _FB_COOKIES_CACHE_KEY
+    raw = (os.getenv("FB_COOKIES_JSON") or "").strip()
+    if not raw:
+        _FB_COOKIES_CACHE = []
+        _FB_COOKIES_CACHE_KEY = ""
+        return []
+    if raw == _FB_COOKIES_CACHE_KEY and _FB_COOKIES_CACHE is not None:
+        return _FB_COOKIES_CACHE
+    try:
+        payload = json.loads(raw)
+        cookies = payload if isinstance(payload, list) else payload.get("cookies", [])
+        normalized = []
+        for item in cookies if isinstance(cookies, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "")
+            if not name:
+                continue
+            cookie = {"name": name, "value": value}
+            domain = str(item.get("domain") or "").strip()
+            path = str(item.get("path") or "").strip() or "/"
+            if domain:
+                cookie["domain"] = domain
+            cookie["path"] = path
+            if "secure" in item:
+                cookie["secure"] = bool(item.get("secure"))
+            if "httpOnly" in item:
+                cookie["httpOnly"] = bool(item.get("httpOnly"))
+            expiry = item.get("expiry")
+            try:
+                if expiry is not None:
+                    cookie["expiry"] = int(expiry)
+            except Exception:
+                pass
+            normalized.append(cookie)
+        _FB_COOKIES_CACHE_KEY = raw
+        _FB_COOKIES_CACHE = normalized
+        return normalized
+    except Exception as exc:
+        _emit(logger, f"FB_COOKIES_JSON không hợp lệ: {str(exc)[:120]}")
+        _FB_COOKIES_CACHE_KEY = raw
+        _FB_COOKIES_CACHE = []
+        return []
+
+
+def _ensure_facebook_cookies(driver, logger: Optional[Callable[[str], None]] = None):
+    if getattr(driver, "_fb_cookies_applied", False):
+        return
+    cookies = _load_fb_cookies_from_env(logger=logger)
+    if not cookies:
+        _emit(logger, "FB_COOKIES_JSON đang trống/chưa set, quét Facebook sẽ chạy không có session.")
+        driver._fb_cookies_applied = True
+        return
+    try:
+        driver.get("https://www.facebook.com/")
+    except Exception:
+        pass
+    applied = 0
+    for cookie in cookies:
+        try:
+            driver.add_cookie(cookie)
+            applied += 1
+        except Exception:
+            continue
+    try:
+        driver.get("https://www.facebook.com/")
+    except Exception:
+        pass
+    driver._fb_cookies_applied = True
+    _emit(logger, f"Đã nạp {applied}/{len(cookies)} cookie Facebook trước khi quét.")
+    try:
+        current_url = str(driver.current_url or "")
+    except Exception:
+        current_url = ""
+    if applied <= 0:
+        _emit(logger, "Không nạp được cookie Facebook nào vào browser session.")
+    if "facebook.com/login" in current_url.lower():
+        _emit(logger, "Sau khi nạp cookie, Facebook vẫn trả về trạng thái login/challenge.")
+
+
+def _load_tt_cookies_from_env(logger: Optional[Callable[[str], None]] = None):
+    global _TT_COOKIES_CACHE, _TT_COOKIES_CACHE_KEY
+    raw = (os.getenv("TT_COOKIES_JSON") or "").strip()
+    if not raw:
+        _TT_COOKIES_CACHE = []
+        _TT_COOKIES_CACHE_KEY = ""
+        return []
+    if raw == _TT_COOKIES_CACHE_KEY and _TT_COOKIES_CACHE is not None:
+        return _TT_COOKIES_CACHE
+    try:
+        payload = json.loads(raw)
+        cookies = payload if isinstance(payload, list) else payload.get("cookies", [])
+        normalized = []
+        for item in cookies if isinstance(cookies, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "")
+            if not name:
+                continue
+            cookie = {"name": name, "value": value}
+            domain = str(item.get("domain") or "").strip() or ".tiktok.com"
+            path = str(item.get("path") or "").strip() or "/"
+            cookie["domain"] = domain
+            cookie["path"] = path
+            if "secure" in item:
+                cookie["secure"] = bool(item.get("secure"))
+            if "httpOnly" in item:
+                cookie["httpOnly"] = bool(item.get("httpOnly"))
+            expiry = item.get("expiry")
+            try:
+                if expiry is not None:
+                    cookie["expiry"] = int(expiry)
+            except Exception:
+                pass
+            normalized.append(cookie)
+        _TT_COOKIES_CACHE_KEY = raw
+        _TT_COOKIES_CACHE = normalized
+        return normalized
+    except Exception as exc:
+        _emit(logger, f"TT_COOKIES_JSON không hợp lệ: {str(exc)[:120]}")
+        _TT_COOKIES_CACHE_KEY = raw
+        _TT_COOKIES_CACHE = []
+        return []
+
+
+def _ensure_tiktok_cookies(driver, logger: Optional[Callable[[str], None]] = None):
+    if getattr(driver, "_tt_cookies_applied", False):
+        return
+    cookies = _load_tt_cookies_from_env(logger=logger)
+    if not cookies:
+        _emit(logger, "TT_COOKIES_JSON đang trống/chưa set, quét TikTok sẽ chạy không có session.")
+        driver._tt_cookies_applied = True
+        return
+    try:
+        driver.set_page_load_timeout(min(8.0, TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS))
+        driver.get("https://www.tiktok.com/")
+    except Exception:
+        pass
+    applied = 0
+    for cookie in cookies:
+        try:
+            driver.add_cookie(cookie)
+            applied += 1
+        except Exception:
+            continue
+    try:
+        driver.set_page_load_timeout(min(8.0, TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS))
+        driver.get("https://www.tiktok.com/")
+    except Exception:
+        pass
+    finally:
+        try:
+            driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+    driver._tt_cookies_applied = True
+    _emit(logger, f"Đã nạp {applied}/{len(cookies)} cookie TikTok trước khi quét.")
+    try:
+        current_url = str(driver.current_url or "")
+    except Exception:
+        current_url = ""
+    if applied <= 0:
+        _emit(logger, "Không nạp được cookie TikTok nào vào browser session.")
+    if "login" in current_url.lower():
+        _emit(logger, "Sau khi nạp cookie, TikTok vẫn trả về trạng thái login/challenge.")
+
+
+def _load_ig_cookies_from_env(logger: Optional[Callable[[str], None]] = None):
+    global _IG_COOKIES_CACHE, _IG_COOKIES_CACHE_KEY
+    raw = (os.getenv("IG_COOKIES_JSON") or "").strip()
+    if not raw:
+        _IG_COOKIES_CACHE = []
+        _IG_COOKIES_CACHE_KEY = ""
+        return []
+    if raw == _IG_COOKIES_CACHE_KEY and _IG_COOKIES_CACHE is not None:
+        return _IG_COOKIES_CACHE
+    try:
+        payload = json.loads(raw)
+        cookies = payload if isinstance(payload, list) else payload.get("cookies", [])
+        normalized = []
+        for item in cookies if isinstance(cookies, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            value = str(item.get("value") or "")
+            if not name:
+                continue
+            cookie = {"name": name, "value": value}
+            domain = str(item.get("domain") or "").strip() or ".instagram.com"
+            path = str(item.get("path") or "").strip() or "/"
+            cookie["domain"] = domain
+            cookie["path"] = path
+            if "secure" in item:
+                cookie["secure"] = bool(item.get("secure"))
+            if "httpOnly" in item:
+                cookie["httpOnly"] = bool(item.get("httpOnly"))
+            expiry = item.get("expiry")
+            try:
+                if expiry is not None:
+                    cookie["expiry"] = int(expiry)
+            except Exception:
+                pass
+            normalized.append(cookie)
+        _IG_COOKIES_CACHE_KEY = raw
+        _IG_COOKIES_CACHE = normalized
+        return normalized
+    except Exception as exc:
+        _emit(logger, f"IG_COOKIES_JSON không hợp lệ: {str(exc)[:120]}")
+        _IG_COOKIES_CACHE_KEY = raw
+        _IG_COOKIES_CACHE = []
+        return []
+
+
+def _ensure_instagram_cookies(driver, logger: Optional[Callable[[str], None]] = None):
+    if getattr(driver, "_ig_cookies_applied", False):
+        return
+    cookies = _load_ig_cookies_from_env(logger=logger)
+    if not cookies:
+        driver._ig_cookies_applied = True
+        return
+    try:
+        driver.set_page_load_timeout(min(8.0, INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS))
+        driver.get("https://www.instagram.com/")
+    except Exception:
+        pass
+    applied = 0
+    for cookie in cookies:
+        try:
+            driver.add_cookie(cookie)
+            applied += 1
+        except Exception:
+            continue
+    try:
+        driver.set_page_load_timeout(min(8.0, INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS))
+        driver.get("https://www.instagram.com/")
+    except Exception:
+        pass
+    finally:
+        try:
+            driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+    driver._ig_cookies_applied = True
+    _emit(logger, f"Đã nạp {applied}/{len(cookies)} cookie Instagram trước khi quét.")
 
 
 def _add_common_browser_args(options, headless: bool = True):
@@ -83,31 +408,26 @@ def _build_chrome_driver(headless: bool = True):
     return driver
 
 
+def _build_remote_chrome_driver(headless: bool = True, logger: Optional[Callable[[str], None]] = None):
+    remote_url = _get_remote_selenium_url()
+    if not remote_url:
+        raise RuntimeError("Thiếu SELENIUM_REMOTE_URL/SELENIUM_HUB_URL")
+    options = ChromeOptions()
+    _add_common_browser_args(options, headless=headless)
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    # Selenium Grid 4 supports both root URL and /wd/hub.
+    driver = webdriver.Remote(command_executor=remote_url, options=options)
+    driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+    _apply_stealth(driver)
+    _emit(logger, f"Selenium Remote URL: {remote_url}")
+    return driver
+
+
 def _build_edge_driver(headless: bool = True):
     options = EdgeOptions()
     _add_common_browser_args(options, headless=headless)
     driver = webdriver.Edge(options=options)
-    driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
-    _apply_stealth(driver)
-    return driver
-
-
-def _build_remote_driver(headless: bool = True, preferred_browser: str = ""):
-    remote_url = _get_remote_webdriver_url()
-    if not remote_url:
-        raise RuntimeError("Missing remote webdriver URL.")
-
-    browser_name = (preferred_browser or os.getenv("SELENIUM_REMOTE_BROWSER", "chrome")).strip().lower()
-    if browser_name == "edge":
-        options = EdgeOptions()
-    else:
-        browser_name = "chrome"
-        options = ChromeOptions()
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        options.add_experimental_option("useAutomationExtension", False)
-
-    _add_common_browser_args(options, headless=headless)
-    driver = webdriver.Remote(command_executor=remote_url, options=options)
     driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
     _apply_stealth(driver)
     return driver
@@ -118,25 +438,17 @@ def create_selenium_driver(
     headless: bool = True,
     preferred_browser: str = "",
 ):
-    remote_url = _get_remote_webdriver_url()
-    if remote_url:
-        try:
-            driver = _build_remote_driver(headless=headless, preferred_browser=preferred_browser)
-            mode = "headless" if headless else "thuong"
-            _emit(logger, f"Selenium dang dung remote browser ({mode})")
-            return driver
-        except Exception as exc:
-            raise RuntimeError(f"Khong ket noi duoc remote Selenium: {str(exc)[:220]}") from exc
-
-    if _is_serverless_runtime():
-        raise RuntimeError(
-            "Runtime nay khong co Chrome/Edge driver cho Selenium. "
-            "Tren Vercel, hay cau hinh SELENIUM_REMOTE_URL de noi toi browser tu xa, "
-            "hoac chay app tren VPS/may tinh co trinh duyet."
-        )
-
+    remote_url = _get_remote_selenium_url()
+    use_remote = bool(remote_url)
+    local_strict_visible = (not use_remote) and LOCAL_STRICT_VISIBLE and _is_local_desktop_runtime()
+    if local_strict_visible and headless:
+        headless = False
+        _emit(logger, "[LOCAL-STABLE] Local mode: ép mở browser thường, tắt headless fallback.")
     errors = []
-    builders = [("Chrome", _build_chrome_driver), ("Edge", _build_edge_driver)]
+    builders = []
+    if use_remote:
+        builders.append(("RemoteChrome", lambda headless=True: _build_remote_chrome_driver(headless=headless, logger=logger)))
+    builders.extend([("Chrome", _build_chrome_driver), ("Edge", _build_edge_driver)])
     preferred = (preferred_browser or "").strip().lower()
     if preferred:
         builders.sort(key=lambda item: 0 if item[0].lower() == preferred else 1)
@@ -148,6 +460,12 @@ def create_selenium_driver(
             return driver
         except Exception as exc:
             errors.append(f"{browser_name}: {str(exc)[:180]}")
+    if local_strict_visible:
+        raise RuntimeError(
+            "LOCAL_VISIBLE_REQUIRED: Không mở được browser giao diện local. "
+            "Đã tắt headless fallback để tránh chạy chập chờn. "
+            + " | ".join(errors)
+        )
     raise RuntimeError("Không mở được Selenium browser. " + " | ".join(errors))
 
 
@@ -158,6 +476,56 @@ def close_selenium_driver(driver):
         driver.quit()
     except Exception:
         pass
+
+
+def _detect_platform_from_url(url: str) -> str:
+    url_lower = str(url or "").strip().lower()
+    if "facebook.com" in url_lower or "fb.watch" in url_lower:
+        return "facebook"
+    if "tiktok.com" in url_lower or "vt.tiktok.com" in url_lower or "vm.tiktok.com" in url_lower:
+        return "tiktok"
+    if "instagram.com" in url_lower:
+        return "instagram"
+    if "youtube.com" in url_lower or "youtu.be" in url_lower:
+        return "youtube"
+    return ""
+
+
+def _is_tiktok_url(url: str) -> bool:
+    return _detect_platform_from_url(url) == "tiktok"
+
+
+def _is_facebook_login_gate(url: str) -> bool:
+    raw = str(url or "").strip().lower()
+    return "facebook.com/login" in raw and "next=" in raw
+
+
+def _extract_facebook_next_url(url: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+        if "facebook.com/login" not in (parsed.netloc or "").lower() and "/login" not in (parsed.path or "").lower():
+            return ""
+        qs = urllib.parse.parse_qs(parsed.query)
+        next_url = str((qs.get("next") or [""])[0] or "").strip()
+        if not next_url:
+            return ""
+        decoded = urllib.parse.unquote(next_url).split("#")[0].strip()
+        if decoded.startswith("/"):
+            decoded = "https://www.facebook.com" + decoded
+        return decoded
+    except Exception:
+        return ""
+
+
+def _resolve_page_load_timeout(url: str) -> float:
+    platform = _detect_platform_from_url(url)
+    if platform == "tiktok":
+        return TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS
+    if platform == "facebook":
+        return FACEBOOK_PAGE_LOAD_TIMEOUT_SECONDS
+    if platform == "instagram":
+        return INSTAGRAM_PAGE_LOAD_TIMEOUT_SECONDS
+    return DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS
 
 
 def resolve_fb_url(url: str, logger: Optional[Callable[[str], None]] = None) -> str:
@@ -183,14 +551,24 @@ def resolve_fb_url(url: str, logger: Optional[Callable[[str], None]] = None) -> 
         try:
             response = requests.head(url, allow_redirects=True, timeout=10)
             if response.url:
-                return response.url.split("#")[0]
+                resolved = response.url.split("#")[0]
+                if _is_facebook_login_gate(resolved):
+                    next_url = _extract_facebook_next_url(resolved)
+                    if next_url:
+                        return next_url
+                return resolved
         except Exception:
             try:
                 response = requests.get(url, allow_redirects=True, timeout=10, stream=True)
                 final_url = response.url
                 response.close()
                 if final_url:
-                    return final_url.split("#")[0]
+                    resolved = final_url.split("#")[0]
+                    if _is_facebook_login_gate(resolved):
+                        next_url = _extract_facebook_next_url(resolved)
+                        if next_url:
+                            return next_url
+                    return resolved
             except Exception as exc:
                 _emit(logger, f"resolve_fb_url request error: {exc}")
                 return url
@@ -200,13 +578,35 @@ def resolve_fb_url(url: str, logger: Optional[Callable[[str], None]] = None) -> 
 
 
 def _wait_until_ready(driver):
-    for _ in range(24):
+    deadline = time.time() + READY_TIMEOUT_SECONDS
+    while time.time() < deadline:
         try:
             if driver.execute_script("return document.readyState") == "complete":
                 break
         except Exception:
             pass
-        time.sleep(0.25)
+        time.sleep(READY_POLL_SECONDS)
+
+
+def _focus_visible_browser_window(driver):
+    if not driver:
+        return
+    try:
+        driver.set_window_position(30, 30)
+    except Exception:
+        pass
+    try:
+        driver.set_window_size(1280, 960)
+    except Exception:
+        pass
+    try:
+        driver.maximize_window()
+    except Exception:
+        pass
+    try:
+        driver.execute_script("window.focus();")
+    except Exception:
+        pass
 
 
 def _read_current_page_bundle(driver):
@@ -244,11 +644,125 @@ def _read_current_page_bundle(driver):
     }
 
 
-def _collect_page_bundle(driver, url: str, logger: Optional[Callable[[str], None]] = None):
+def _extract_meta_tags_from_html(html: str):
+    metas = {}
+    if not html:
+        return metas
+    for match in re.finditer(
+        r"<meta[^>]+(?:property|name)=[\"']([^\"']+)[\"'][^>]*content=[\"']([^\"']*)[\"'][^>]*>",
+        html,
+        flags=re.IGNORECASE,
+    ):
+        key = str(match.group(1) or "").strip()
+        value = str(match.group(2) or "").strip()
+        if key and value and key not in metas:
+            metas[key] = value
+    for match in re.finditer(
+        r"<meta[^>]+content=[\"']([^\"']*)[\"'][^>]*(?:property|name)=[\"']([^\"']+)[\"'][^>]*>",
+        html,
+        flags=re.IGNORECASE,
+    ):
+        value = str(match.group(1) or "").strip()
+        key = str(match.group(2) or "").strip()
+        if key and value and key not in metas:
+            metas[key] = value
+    return metas
+
+
+def _build_requests_cookies_for_platform(platform: str):
+    cookies = requests.cookies.RequestsCookieJar()
+    loader_map = {
+        "facebook": _load_fb_cookies_from_env,
+        "tiktok": _load_tt_cookies_from_env,
+        "instagram": _load_ig_cookies_from_env,
+    }
+    loader = loader_map.get(platform)
+    if not loader:
+        return cookies
+    for item in loader():
+        name = str(item.get("name") or "").strip()
+        value = str(item.get("value") or "").strip()
+        if not name:
+            continue
+        domain = str(item.get("domain") or "").strip() or None
+        path = str(item.get("path") or "").strip() or "/"
+        try:
+            cookies.set(name, value, domain=domain, path=path)
+        except Exception:
+            continue
+    return cookies
+
+
+def _collect_page_bundle_via_requests(url: str, platform: str, logger: Optional[Callable[[str], None]] = None):
+    timeout_sec = max(6.0, min(15.0, _resolve_page_load_timeout(url)))
+    headers = {
+        "User-Agent": DEFAULT_USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9,vi;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
     try:
+        resp = requests.get(
+            url,
+            headers=headers,
+            cookies=_build_requests_cookies_for_platform(platform),
+            allow_redirects=True,
+            timeout=timeout_sec,
+        )
+        source = resp.text or ""
+        metas = _extract_meta_tags_from_html(source)
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", source, flags=re.IGNORECASE | re.DOTALL)
+        title = re.sub(r"\s+", " ", str(title_match.group(1) if title_match else "")).strip()
+        text = re.sub(r"<[^>]+>", " ", source)
+        text = re.sub(r"\s+", " ", text).strip()
+        final_url = str(resp.url or url)
+        return {
+            "source": source,
+            "text": text,
+            "metas": metas,
+            "title": title,
+            "url": final_url,
+            "_via_requests": True,
+        }
+    except Exception as exc:
+        _emit(logger, f"Requests fallback lỗi: {str(exc)[:120]}")
+        return None
+
+
+def _collect_page_bundle(driver, url: str, logger: Optional[Callable[[str], None]] = None):
+    target_timeout = _resolve_page_load_timeout(url)
+    timed_out = False
+    try:
+        driver.set_page_load_timeout(target_timeout)
         driver.get(url)
     except TimeoutException:
+        timed_out = True
         _emit(logger, f"Timeout khi tải trang: {url[:90]}")
+        try:
+            driver.execute_script("window.stop();")
+        except Exception:
+            pass
+    finally:
+        try:
+            driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+
+    if timed_out:
+        # Driver may be in unstable renderer state after timeout.
+        # Return a lightweight bundle immediately to avoid extra blocking.
+        try:
+            current_url = driver.current_url or url
+        except Exception:
+            current_url = url
+        return {
+            "source": "",
+            "text": "",
+            "metas": {},
+            "title": "",
+            "url": current_url,
+            "_timed_out": True,
+        }
+
     _wait_until_ready(driver)
     time.sleep(DEFAULT_SETTLE_SECONDS)
     try:
@@ -360,17 +874,105 @@ def _extract_text_metric(text: str, labels) -> Optional[int]:
     return _extract_number(text, patterns)
 
 
+def _format_air_date(day, month) -> str:
+    try:
+        day_num = int(day)
+        month_num = int(month)
+    except Exception:
+        return ""
+    if not (1 <= day_num <= 31 and 1 <= month_num <= 12):
+        return ""
+    return f"{day_num}-{month_num}"
+
+
+def _format_air_date_from_datetime(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return _format_air_date(value.day, value.month)
+    if isinstance(value, (int, float)):
+        timestamp = float(value)
+        if timestamp > 1_000_000_000_000:
+            timestamp /= 1000.0
+        try:
+            return _format_air_date_from_datetime(datetime.fromtimestamp(timestamp))
+        except Exception:
+            return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    if re.fullmatch(r"\d{10,13}", raw):
+        try:
+            return _format_air_date_from_datetime(float(raw))
+        except Exception:
+            return ""
+    normalized = raw.replace("T", " ").replace("Z", "").strip()
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%d",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
+        "%m-%d",
+        "%m/%d",
+        "%m.%d",
+    ):
+        try:
+            parsed = datetime.strptime(normalized, fmt)
+            return _format_air_date(parsed.day, parsed.month)
+        except Exception:
+            continue
+    try:
+        return _format_air_date_from_datetime(datetime.fromisoformat(normalized))
+    except Exception:
+        return ""
+
+
+def _extract_air_date_from_text(text: str) -> str:
+    if not text:
+        return ""
+    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    for line in lines[:20]:
+        cleaned = line.replace("·", " ").replace("•", " ").strip()
+        match = re.fullmatch(r"([01]?\d)\s*[-/.]\s*([0-3]?\d)", cleaned)
+        if match:
+            month_token, day_token = match.groups()
+            return _format_air_date(day_token, month_token)
+    return ""
+
+
 def _has_tiktok_challenge(bundle) -> bool:
     text = (bundle.get("text") or "").strip().lower()
     source = (bundle.get("source") or "").lower()
-    return any(
-        marker in text or marker in source
-        for marker in (
-            "drag the slider to fit the puzzle",
-            "verifying...",
-            "captcha",
-        )
+    visible_markers = (
+        "drag the slider to fit the puzzle",
+        "verify to continue",
+        "complete the puzzle",
     )
+    if any(marker in text for marker in visible_markers):
+        return True
+    source_markers = (
+        "secsdk-captcha",
+        "captcha-verify-container",
+        "captcha_container",
+        "drag the slider to fit the puzzle",
+    )
+    return any(marker in source for marker in source_markers)
+
+
+def _payload_has_tiktok_signal(payload) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    signal_keys = ("v", "l", "s", "c", "save")
+    signal_count = 0
+    for key in signal_keys:
+        try:
+            if int(payload.get(key) or 0) > 0:
+                signal_count += 1
+        except Exception:
+            continue
+    return signal_count >= 2
 
 
 def _extract_tiktok_caption(bundle) -> str:
@@ -421,6 +1023,9 @@ def _extract_tiktok_photo_from_text(bundle):
         "s": metric_values[-1],
         "cap": _extract_tiktok_caption(bundle),
     }
+    air_date = _extract_air_date_from_text(text)
+    if air_date:
+        payload["air_date"] = air_date
     if len(metric_values) >= 4:
         payload["save"] = metric_values[-2]
     return payload
@@ -445,6 +1050,9 @@ def _extract_tiktok(bundle):
         anchor_infos = item.get("anchorInfos") if isinstance(item, dict) else []
         has_shop_anchor = bool(anchors or anchor_infos)
         is_ad_video = bool(item.get("isAd")) if isinstance(item, dict) else False
+        air_date = _format_air_date_from_datetime(
+            item.get("createTime") if isinstance(item, dict) else None
+        ) or _extract_air_date_from_text(bundle.get("text") or "")
         payload = {
             "v": _parse_compact_number(_pick_dict_value(stats_v2, stats, "playCount")) or 0,
             "l": _parse_compact_number(_pick_dict_value(stats_v2, stats, "diggCount")) or 0,
@@ -455,6 +1063,8 @@ def _extract_tiktok(bundle):
             or metas.get("og:description", "")
             or metas.get("og:title", ""),
         }
+        if air_date:
+            payload["air_date"] = air_date
         save_count = _parse_compact_number(_pick_dict_value(stats_v2, stats, "collectCount"))
         if save_count is not None:
             payload["save"] = save_count
@@ -468,7 +1078,7 @@ def _extract_tiktok(bundle):
             payload["_warning"] = (
                 f"TikTok video {warning_text}. TikTok web public có thể chỉ trả số liệu giới hạn, nên các chỉ số có thể lệch."
             )
-        if any(payload.get(key) for key in ("v", "l", "s", "c", "save")) or payload.get("cap"):
+        if any(payload.get(key) for key in ("v", "l", "s", "c", "save")) or payload.get("cap") or payload.get("air_date"):
             return payload
 
     if is_photo_post:
@@ -485,6 +1095,11 @@ def _extract_tiktok(bundle):
         or metas.get("og:description", "")
         or metas.get("og:title", ""),
     }
+    air_date = _format_air_date_from_datetime(
+        _extract_string(source, [r'"createTime"\s*:\s*"?(\d{10,13})"?'])
+    ) or _extract_air_date_from_text(bundle.get("text") or "")
+    if air_date:
+        payload["air_date"] = air_date
     save_count = _extract_number(
         source,
         [
@@ -522,6 +1137,12 @@ def _extract_instagram(bundle):
                     continue
                 caption_obj = item.get("caption")
                 caption_text = caption_obj.get("text", "") if isinstance(caption_obj, dict) else str(caption_obj or "")
+                air_date = (
+                    _format_air_date_from_datetime(item.get("taken_at"))
+                    or _format_air_date_from_datetime(item.get("taken_at_timestamp"))
+                    or _format_air_date_from_datetime(item.get("published_at"))
+                    or _extract_air_date_from_text(text)
+                )
                 payload = {
                     "v": _parse_compact_number(item.get("view_count"))
                     or _parse_compact_number(item.get("play_count"))
@@ -534,10 +1155,12 @@ def _extract_instagram(bundle):
                     "c": _parse_compact_number(item.get("comment_count")) or 0,
                     "cap": caption_text or metas.get("og:description", "") or metas.get("og:title", ""),
                 }
-                if any(payload.get(key) for key in ("v", "l", "s", "c")) or payload.get("cap"):
+                if air_date:
+                    payload["air_date"] = air_date
+                if any(payload.get(key) for key in ("v", "l", "s", "c")) or payload.get("cap") or payload.get("air_date"):
                     return payload
 
-    return {
+    payload = {
         "v": _extract_number(
             source,
             [
@@ -572,6 +1195,22 @@ def _extract_instagram(bundle):
         or metas.get("og:description", "")
         or metas.get("og:title", ""),
     }
+    air_date = (
+        _format_air_date_from_datetime(
+            _extract_string(
+                source,
+                [
+                    r'"taken_at"\s*:\s*"?(\d{10,13})"?',
+                    r'"taken_at_timestamp"\s*:\s*"?(\d{10,13})"?',
+                    r'"published_at"\s*:\s*"?(\d{10,13})"?',
+                ],
+            )
+        )
+        or _extract_air_date_from_text(text)
+    )
+    if air_date:
+        payload["air_date"] = air_date
+    return payload
 
 
 def _extract_facebook_target_ids(url: str):
@@ -690,6 +1329,21 @@ def _extract_facebook(bundle):
         )
         or metas.get("og:title", ""),
     }
+    air_date = (
+        _format_air_date_from_datetime(
+            _extract_string(
+                scoped_source,
+                [
+                    r'"creation_time"\s*:\s*"?(\d{10,13})"?',
+                    r'"publish_time"\s*:\s*"?(\d{10,13})"?',
+                    r'"story_creation_time"\s*:\s*"?(\d{10,13})"?',
+                ],
+            )
+        )
+        or _extract_air_date_from_text(text)
+    )
+    if air_date:
+        payload["air_date"] = air_date
 
     view_value = (
         _extract_number(
@@ -816,22 +1470,71 @@ def _extract_facebook(bundle):
 
 
 def _should_retry_tiktok_visually(bundle, payload) -> bool:
-    url = (bundle.get("url") or "").lower()
-    text = (bundle.get("text") or "").strip().lower()
-    has_signal = any((payload or {}).get(key) for key in ("v", "l", "s", "c", "save"))
-    photo_post = "/photo/" in url
-    login_only = text in {"", "log in"} or text.startswith("log in\n")
-    return (photo_post or _has_tiktok_challenge(bundle)) and (not has_signal or login_only or _has_tiktok_challenge(bundle))
+    if _has_tiktok_challenge(bundle):
+        # Neu van doc duoc so lieu kha day du thi khong can day Chrome thuong len nua.
+        if _payload_has_tiktok_signal(payload):
+            return False
+        return True
+
+    # Chi mo Chrome thuong khi that su gap slider captcha.
+    # Cac case TikTok Shop/App banner van co so lieu thi khong can day cua so len nua.
+    return False
+
+
+def _wait_for_tiktok_manual_challenge(
+    driver,
+    bundle,
+    logger: Optional[Callable[[str], None]] = None,
+):
+    if not _has_tiktok_challenge(bundle):
+        return bundle
+
+    _focus_visible_browser_window(driver)
+    _emit(
+        logger,
+        "TikTok đang hiện captcha slider. Chrome thường đã mở ra, bạn kéo captcha xong thì tool sẽ tự đọc tiếp số liệu.",
+    )
+
+    best_bundle = bundle
+    deadline = time.time() + TIKTOK_MANUAL_CHALLENGE_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        time.sleep(TIKTOK_MANUAL_CHALLENGE_POLL_SECONDS)
+        try:
+            current_bundle = _read_current_page_bundle(driver)
+        except Exception:
+            continue
+        if len(current_bundle.get("text", "")) >= len(best_bundle.get("text", "")):
+            best_bundle = current_bundle
+        if not _has_tiktok_challenge(current_bundle):
+            _emit(logger, "Đã qua captcha TikTok, đang lấy lại số liệu...")
+            time.sleep(0.6)
+            try:
+                refreshed_bundle = _read_current_page_bundle(driver)
+                if len(refreshed_bundle.get("text", "")) >= len(best_bundle.get("text", "")):
+                    best_bundle = refreshed_bundle
+            except Exception:
+                pass
+            return best_bundle
+
+    _emit(logger, "TikTok captcha chưa được giải xong trong thời gian chờ, bỏ qua lần đọc này.")
+    return best_bundle
 
 
 def _collect_tiktok_visible_bundle(driver, url: str, logger: Optional[Callable[[str], None]] = None):
     try:
+        driver.set_page_load_timeout(TIKTOK_PAGE_LOAD_TIMEOUT_SECONDS)
         driver.get(url)
     except TimeoutException:
         _emit(logger, f"Timeout khi tải TikTok visual retry: {url[:90]}")
+    finally:
+        try:
+            driver.set_page_load_timeout(DEFAULT_PAGE_LOAD_TIMEOUT_SECONDS)
+        except Exception:
+            pass
     _wait_until_ready(driver)
 
     best_bundle = _read_current_page_bundle(driver)
+    best_bundle = _wait_for_tiktok_manual_challenge(driver, best_bundle, logger=logger)
     deadline = time.time() + 12
     while time.time() < deadline:
         time.sleep(1)
@@ -863,9 +1566,39 @@ def _retry_tiktok_with_visible_browser(url: str, logger: Optional[Callable[[str]
 
 
 def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Optional[Callable[[str], None]] = None):
-    platform = (platform_name or "").strip().lower()
+    global _TIKTOK_TIMEOUT_STREAK, _TIKTOK_TIMEOUT_COOLDOWN_UNTIL
+    requested_platform = (platform_name or "").strip().lower()
+    detected_platform = _detect_platform_from_url(url)
+    platform = detected_platform or requested_platform
+    if detected_platform and requested_platform and detected_platform != requested_platform:
+        _emit(
+            logger,
+            f"Phát hiện lệch platform: sheet ghi {requested_platform}, nhưng link thực là {detected_platform}. Dùng theo link thực.",
+        )
     if platform == "facebook":
+        if driver is not None:
+            _ensure_facebook_cookies(driver, logger=logger)
+        original_fb_url = url
         url = resolve_fb_url(url, logger=logger)
+        if _is_facebook_login_gate(url):
+            fallback_url = _extract_facebook_next_url(url) or original_fb_url
+            if fallback_url and not _is_facebook_login_gate(fallback_url):
+                _emit(logger, "Facebook trả về login-gate, chuyển về link bài gốc để thử lại.")
+                url = fallback_url
+            else:
+                _emit(logger, "Facebook trả về trang login/chặn truy cập, bỏ qua link này để chạy tiếp nhanh.")
+                return None
+    elif platform == "tiktok":
+        now_ts = time.time()
+        if now_ts < _TIKTOK_TIMEOUT_COOLDOWN_UNTIL:
+            remaining = int(max(1, _TIKTOK_TIMEOUT_COOLDOWN_UNTIL - now_ts))
+            _emit(logger, f"TikTok đang cooldown {remaining}s sau nhiều timeout liên tiếp, bỏ qua nhanh link này.")
+            return None
+        if driver is not None:
+            _ensure_tiktok_cookies(driver, logger=logger)
+    elif platform == "instagram":
+        if driver is not None:
+            _ensure_instagram_cookies(driver, logger=logger)
 
     own_driver = driver is None
     if own_driver:
@@ -873,6 +1606,30 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
 
     try:
         bundle = _collect_page_bundle(driver, url, logger=logger)
+        if bundle.get("_timed_out"):
+            if platform == "tiktok":
+                _emit(logger, "TikTok timeout: bỏ qua retry sâu trên cùng driver để tránh treo dây chuyền.")
+                _TIKTOK_TIMEOUT_STREAK += 1
+                if _TIKTOK_TIMEOUT_STREAK >= TIKTOK_TIMEOUT_STREAK_THRESHOLD:
+                    _TIKTOK_TIMEOUT_COOLDOWN_UNTIL = time.time() + TIKTOK_TIMEOUT_COOLDOWN_SECONDS
+                    _emit(
+                        logger,
+                        f"TikTok timeout liên tiếp, tạm cooldown {int(TIKTOK_TIMEOUT_COOLDOWN_SECONDS)}s để tránh nghẽn tiến trình.",
+                    )
+                return None
+            if TIMEOUT_RECOVERY_RETRY_ATTEMPTS > 0:
+                for attempt in range(1, TIMEOUT_RECOVERY_RETRY_ATTEMPTS + 1):
+                    if TIMEOUT_RECOVERY_RETRY_DELAY_SECONDS > 0:
+                        time.sleep(TIMEOUT_RECOVERY_RETRY_DELAY_SECONDS)
+                    _emit(logger, f"{platform.capitalize()} timeout, thử lại nhanh lần {attempt}/{TIMEOUT_RECOVERY_RETRY_ATTEMPTS}...")
+                    retry_bundle = _collect_page_bundle(driver, url, logger=logger)
+                    if not retry_bundle.get("_timed_out"):
+                        bundle = retry_bundle
+                        break
+                if bundle.get("_timed_out"):
+                    return None
+            else:
+                return None
         extractor_map = {
             "tiktok": _extract_tiktok,
             "instagram": _extract_instagram,
@@ -882,21 +1639,85 @@ def fetch_social_stats(url: str, platform_name: str, driver=None, logger: Option
         if not extractor:
             return None
         payload = extractor(bundle)
-        if platform == "tiktok" and _should_retry_tiktok_visually(bundle, payload):
+        if platform == "tiktok" and not payload and TIKTOK_SOFT_RETRY_ATTEMPTS > 0:
+            for attempt in range(1, TIKTOK_SOFT_RETRY_ATTEMPTS + 1):
+                if TIKTOK_SOFT_RETRY_DELAY_SECONDS > 0:
+                    time.sleep(TIKTOK_SOFT_RETRY_DELAY_SECONDS)
+                _emit(logger, f"TikTok retry ngắn lần {attempt}/{TIKTOK_SOFT_RETRY_ATTEMPTS}...")
+                retry_bundle = _collect_page_bundle(driver, url, logger=logger)
+                retry_payload = extractor(retry_bundle)
+                if retry_payload:
+                    payload = retry_payload
+                    break
+        if platform == "facebook" and not payload and FACEBOOK_SOFT_RETRY_ATTEMPTS > 0:
+            for attempt in range(1, FACEBOOK_SOFT_RETRY_ATTEMPTS + 1):
+                if FACEBOOK_SOFT_RETRY_DELAY_SECONDS > 0:
+                    time.sleep(FACEBOOK_SOFT_RETRY_DELAY_SECONDS)
+                _emit(logger, f"Facebook retry ngắn lần {attempt}/{FACEBOOK_SOFT_RETRY_ATTEMPTS}...")
+                retry_bundle = _collect_page_bundle(driver, url, logger=logger)
+                retry_payload = extractor(retry_bundle)
+                if retry_payload:
+                    payload = retry_payload
+                    break
+        if platform == "instagram" and not payload and INSTAGRAM_SOFT_RETRY_ATTEMPTS > 0:
+            for attempt in range(1, INSTAGRAM_SOFT_RETRY_ATTEMPTS + 1):
+                if INSTAGRAM_SOFT_RETRY_DELAY_SECONDS > 0:
+                    time.sleep(INSTAGRAM_SOFT_RETRY_DELAY_SECONDS)
+                _emit(logger, f"Instagram retry ngắn lần {attempt}/{INSTAGRAM_SOFT_RETRY_ATTEMPTS}...")
+                retry_bundle = _collect_page_bundle(driver, url, logger=logger)
+                retry_payload = extractor(retry_bundle)
+                if retry_payload:
+                    payload = retry_payload
+                    break
+        if platform == "tiktok" and _is_tiktok_url(url) and _should_retry_tiktok_visually(bundle, payload):
             retry_payload = _retry_tiktok_with_visible_browser(url, logger=logger)
             if retry_payload:
                 payload = retry_payload
+        if not payload:
+            final_url = str(bundle.get("url") or "")
+            title_text = str(bundle.get("title") or "")
+            low_url = final_url.lower()
+            low_title = title_text.lower()
+            if platform == "facebook" and ("facebook.com/login" in low_url or "log in to facebook" in low_title):
+                _emit(logger, "Facebook đang trả về trang login/chặn truy cập nên khó đọc số liệu công khai.")
+            if platform == "instagram" and ("instagram.com/accounts/login" in low_url or "login" in low_title):
+                _emit(logger, "Instagram đang trả về trang login/chặn truy cập nên khó đọc số liệu công khai.")
+            if platform == "tiktok" and ("login" in low_url or "verify" in low_url or "captcha" in low_title):
+                _emit(logger, "TikTok đang trả về challenge/login nên khó đọc số liệu công khai.")
+            fallback_bundle = _collect_page_bundle_via_requests(url, platform, logger=logger)
+            if fallback_bundle:
+                try:
+                    payload = extractor(fallback_bundle)
+                    if payload:
+                        _emit(logger, f"{platform.capitalize()} lấy được dữ liệu qua fallback requests.")
+                except Exception:
+                    payload = None
         if not payload:
             return None
         warning_message = str(payload.get("_warning", "") or "").strip()
         if warning_message:
             _emit(logger, warning_message)
         has_signal = any(payload.get(key) for key in ("v", "l", "s", "c", "save"))
-        if has_signal or payload.get("cap"):
+        if platform == "tiktok":
+            _TIKTOK_TIMEOUT_STREAK = 0
+            _TIKTOK_TIMEOUT_COOLDOWN_UNTIL = 0.0
+        if has_signal or payload.get("cap") or payload.get("air_date"):
             return payload
         return None
     except WebDriverException as exc:
-        _emit(logger, f"Lỗi Selenium {platform}: {str(exc)[:160]}")
+        error_text = str(exc)
+        error_lower = error_text.lower()
+        if (
+            platform == "tiktok"
+            and driver is not None
+            and "timed out receiving message from renderer" in error_lower
+        ):
+            try:
+                setattr(driver, "_needs_restart", True)
+            except Exception:
+                pass
+            _emit(logger, "TikTok renderer timeout, đánh dấu restart driver để quét nhanh dòng tiếp theo.")
+        _emit(logger, f"Lỗi Selenium {platform}: {error_text[:160]}")
         return None
     except Exception as exc:
         _emit(logger, f"Lỗi đọc dữ liệu {platform}: {str(exc)[:160]}")
