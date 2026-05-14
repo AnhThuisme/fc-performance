@@ -189,6 +189,8 @@ DASHBOARD_CACHE_TTL_SECONDS = 300
 DASHBOARD_REFRESH_TTL_SECONDS = max(30, int(os.getenv("DASHBOARD_REFRESH_TTL_SECONDS", "120")))
 DASHBOARD_REFRESH_INFLIGHT = {}  # {f"{email}:{section}": started_at_epoch}
 DASHBOARD_REFRESH_LOCK = threading.Lock()
+DASHBOARD_REFRESH_MAX_WORKERS = max(2, int(os.getenv("DASHBOARD_REFRESH_MAX_WORKERS", "3")))
+DASHBOARD_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=DASHBOARD_REFRESH_MAX_WORKERS)
 DASHBOARD_CACHE_SAVE_LOCK = threading.Lock()
 DASHBOARD_CACHE_SAVE_INTERVAL_SECONDS = max(1, int(os.getenv("DASHBOARD_CACHE_SAVE_INTERVAL_SECONDS", "3")))
 DASHBOARD_CACHE_LAST_SAVE_AT = 0.0
@@ -744,9 +746,16 @@ def schedule_dashboard_refresh(background_tasks: BackgroundTasks, user_email: st
             return False
         DASHBOARD_REFRESH_INFLIGHT[key] = now_ts
     try:
-        background_tasks.add_task(background_refresh_dashboard_data, user_email, section)
+        # Run refresh jobs in a small shared pool so panels can warm in parallel.
+        DASHBOARD_REFRESH_EXECUTOR.submit(background_refresh_dashboard_data, user_email, section)
         return True
     except Exception:
+        try:
+            if background_tasks is not None:
+                background_tasks.add_task(background_refresh_dashboard_data, user_email, section)
+                return True
+        except Exception:
+            pass
         with DASHBOARD_REFRESH_LOCK:
             DASHBOARD_REFRESH_INFLIGHT.pop(key, None)
         return False
@@ -5876,11 +5885,6 @@ def build_posts_panel_html(sheet=None, state=None):
         entry_slug = f"{build_dom_slug(entry_sheet_name, 'sheet')}-{entry_index}"
         
         try:
-            # Check if this sheet is already in SHEET_DATA_CACHE (handled inside get_sheet_records)
-            # but we still want to stagger the calls to get_worksheet/get_sheet_records
-            if entry_index > 0:
-                time.sleep(0.3)
-                
             ws = sheet if (
                 sheet is not None
                 and entry_sheet_id == (runtime_state["active_sheet_id"] or "")
