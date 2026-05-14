@@ -807,8 +807,6 @@ def background_refresh_dashboard_data(user_email, section_type):
         active_ws = None
         if runtime_state.get("active_sheet_id") and runtime_state.get("active_sheet_name"):
             try:
-                if section_type in {"overview", "posts"}:
-                    time.sleep(0.2)
                 active_ws = get_worksheet(runtime_state["active_sheet_name"], runtime_state["active_sheet_id"], runtime_state)
             except Exception:
                 pass
@@ -16592,7 +16590,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                 if (data.status === "processing") {{
                                     attempts++;
                                     if (attempts < 45) {{
-                                        const retryDelay = panel.id === "config" ? 700 : (panel.id === "overview" ? 1000 : 1400);
+                                        const retryDelay = panel.id === "config" ? 300 : (panel.id === "overview" ? 450 : 650);
                                         console.log(`[DASH] ${{panel.id}} is processing, retrying in ${{retryDelay}}ms...`);
                                         setTimeout(fetchData, retryDelay);
                                     }} else {{
@@ -16609,7 +16607,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
                                 console.error(`[DASH] ${{panel.id}} load error:`, e);
                             }}
                         }};
-                        const startDelay = panelIndex === 0 ? 0 : Math.min(2200, panelIndex * 450);
+                        const startDelay = panelIndex === 0 ? 0 : Math.min(720, panelIndex * 160);
                         setTimeout(fetchData, startDelay);
                     }});
                 }};
