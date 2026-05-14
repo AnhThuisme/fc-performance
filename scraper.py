@@ -14,7 +14,7 @@ import socket
 import ssl
 import threading
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
 import urllib.parse
@@ -191,6 +191,7 @@ DASHBOARD_REFRESH_INFLIGHT = {}  # {f"{email}:{section}": started_at_epoch}
 DASHBOARD_REFRESH_LOCK = threading.Lock()
 DASHBOARD_REFRESH_MAX_WORKERS = max(2, int(os.getenv("DASHBOARD_REFRESH_MAX_WORKERS", "3")))
 DASHBOARD_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=DASHBOARD_REFRESH_MAX_WORKERS)
+POSTS_PANEL_BUILD_WORKERS = max(1, int(os.getenv("POSTS_PANEL_BUILD_WORKERS", "3")))
 DASHBOARD_CACHE_SAVE_LOCK = threading.Lock()
 DASHBOARD_CACHE_SAVE_INTERVAL_SECONDS = max(1, int(os.getenv("DASHBOARD_CACHE_SAVE_INTERVAL_SECONDS", "3")))
 DASHBOARD_CACHE_LAST_SAVE_AT = 0.0
@@ -5872,8 +5873,42 @@ def build_posts_panel_html(sheet=None, state=None):
         </section>
         """
 
-    datasets = []
-    for entry_index, entry in enumerate(saved_entries):
+    active_sheet_id = str(runtime_state.get("active_sheet_id", "") or "").strip()
+    active_sheet_name = str(runtime_state.get("active_sheet_name", "") or "").strip()
+
+    def _build_error_dataset(entry_index: int, entry: dict, entry_slug: str, error_text: str):
+        entry_sheet_id = str(entry.get("sheet_id", "") or "").strip()
+        entry_sheet_name = str(entry.get("sheet_name", "") or "").strip()
+        entry_sheet_gid = str(entry.get("sheet_gid", "") or "0").strip() or "0"
+        entry_saved_at_text = str(entry.get("saved_at_text", "") or "").strip()
+        entry_campaign_label = str(entry.get("campaign_label", "") or "").strip()
+        entry_brand_label = str(entry.get("brand_label", "") or "").strip()
+        entry_industry_label = str(entry.get("industry_label", "") or "").strip()
+        entry_campaign_description = str(entry.get("campaign_description", "") or "").strip()
+        return {
+            "sheet_title": entry_sheet_name or f"Sheet {entry_index + 1}",
+            "sheet_slug": entry_slug,
+            "sheet_id": entry_sheet_id,
+            "sheet_gid": entry_sheet_gid,
+            "campaign_label": entry_campaign_label,
+            "brand_label": entry_brand_label,
+            "industry_label": entry_industry_label,
+            "campaign_description": entry_campaign_description,
+            "total_posts": 0,
+            "total_views": 0,
+            "total_reaction": 0,
+            "total_share": 0,
+            "total_comment": 0,
+            "total_buzz": 0,
+            "creator_count": 0,
+            "campaign_count": 0,
+            "platform_counts": {"tiktok": 0, "facebook": 0, "instagram": 0, "youtube": 0, "khac": 0},
+            "rows_html": "",
+            "error": str(error_text or ""),
+            "saved_at_text": entry_saved_at_text,
+        }
+
+    def _collect_dataset(entry_index: int, entry: dict, preloaded_sheet=None):
         entry_sheet_id = str(entry.get("sheet_id", "") or "").strip()
         entry_sheet_name = str(entry.get("sheet_name", "") or "").strip()
         entry_sheet_gid = str(entry.get("sheet_gid", "") or "0").strip() or "0"
@@ -5883,14 +5918,8 @@ def build_posts_panel_html(sheet=None, state=None):
         entry_industry_label = str(entry.get("industry_label", "") or "").strip()
         entry_campaign_description = str(entry.get("campaign_description", "") or "").strip()
         entry_slug = f"{build_dom_slug(entry_sheet_name, 'sheet')}-{entry_index}"
-        
         try:
-            ws = sheet if (
-                sheet is not None
-                and entry_sheet_id == (runtime_state["active_sheet_id"] or "")
-                and entry_sheet_name == (runtime_state["active_sheet_name"] or "")
-            ) else get_worksheet(entry_sheet_name, entry_sheet_id, runtime_state)
-            
+            ws = preloaded_sheet if preloaded_sheet is not None else get_worksheet(entry_sheet_name, entry_sheet_id, runtime_state)
             dataset = collect_posts_dataset_for_worksheet(
                 ws,
                 entry_index,
@@ -5906,31 +5935,41 @@ def build_posts_panel_html(sheet=None, state=None):
             dataset["brand_label"] = entry_brand_label or str(dataset.get("brand_label", "") or "").strip()
             dataset["industry_label"] = entry_industry_label
             dataset["campaign_description"] = entry_campaign_description
+            return entry_index, dataset
         except Exception as exc:
-            dataset = {
-                "sheet_title": entry_sheet_name or f"Sheet {entry_index + 1}",
-                "sheet_slug": entry_slug,
-                "sheet_id": entry_sheet_id,
-                "sheet_gid": entry_sheet_gid,
-                "campaign_label": entry_campaign_label,
-                "brand_label": entry_brand_label,
-                "industry_label": entry_industry_label,
-                "campaign_description": entry_campaign_description,
-                "total_posts": 0,
-                "total_views": 0,
-                "total_reaction": 0,
-                "total_share": 0,
-                "total_comment": 0,
-                "total_buzz": 0,
-                "creator_count": 0,
-                "campaign_count": 0,
-                "brand_label": "",
-                "platform_counts": {"tiktok": 0, "facebook": 0, "instagram": 0, "youtube": 0, "khac": 0},
-                "rows_html": "",
-                "error": str(exc),
-                "saved_at_text": entry_saved_at_text,
-            }
-        datasets.append(dataset)
+            return entry_index, _build_error_dataset(entry_index, entry, entry_slug, str(exc))
+
+    datasets = [None] * len(saved_entries)
+    pending_futures = []
+    max_workers = min(max(1, len(saved_entries)), POSTS_PANEL_BUILD_WORKERS)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for entry_index, entry in enumerate(saved_entries):
+            entry_sheet_id = str(entry.get("sheet_id", "") or "").strip()
+            entry_sheet_name = str(entry.get("sheet_name", "") or "").strip()
+            is_active_sheet = (
+                sheet is not None
+                and entry_sheet_id == active_sheet_id
+                and entry_sheet_name == active_sheet_name
+            )
+            if is_active_sheet:
+                idx, ds = _collect_dataset(entry_index, entry, preloaded_sheet=sheet)
+                datasets[idx] = ds
+                continue
+            pending_futures.append(executor.submit(_collect_dataset, entry_index, entry))
+
+        for future in as_completed(pending_futures):
+            try:
+                idx, ds = future.result()
+                datasets[idx] = ds
+            except Exception as exc:
+                # Safety net: should be rare because _collect_dataset already handles exceptions.
+                idx = next((i for i, val in enumerate(datasets) if val is None), 0)
+                fallback_entry = saved_entries[idx] if 0 <= idx < len(saved_entries) else {}
+                entry_sheet_name = str(fallback_entry.get("sheet_name", "") or "").strip()
+                entry_slug = f"{build_dom_slug(entry_sheet_name, 'sheet')}-{idx}"
+                datasets[idx] = _build_error_dataset(idx, fallback_entry, entry_slug, str(exc))
+
+    datasets = [item for item in datasets if isinstance(item, dict)]
 
     campaign_counts = {}
     for dataset in datasets:
