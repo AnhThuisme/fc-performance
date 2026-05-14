@@ -3,6 +3,7 @@ import re
 import time
 import html
 import json
+import tempfile
 import calendar
 import hmac
 import base64
