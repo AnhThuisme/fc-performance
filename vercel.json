@@ -1,12 +1,15 @@
 {
   "version": 2,
+  "builds": [
+    {
+      "src": "main.py",
+      "use": "@vercel/python"
+    }
+  ],
   "routes": [
     {
       "src": "/(.*)",
-      "status": 307,
-      "headers": {
-        "Location": "https://fc-performance.vercel.app/$1"
-      }
+      "dest": "main.py"
     }
   ]
 }
