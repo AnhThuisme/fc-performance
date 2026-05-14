@@ -105,6 +105,7 @@ DASHBOARD_SECTION_IDS = {
 # ==========================================
 SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE", runtime_file_path("credential.json")).strip() or runtime_file_path("credential.json")
 AUTH_SETTINGS_FILE = os.getenv("AUTH_SETTINGS_FILE", runtime_file_path("auth_settings.json")).strip() or runtime_file_path("auth_settings.json")
+AUTH_SETTINGS_BUNDLE_FILE = os.path.join(os.path.dirname(__file__), "auth_settings.json")
 SESSION_COOKIE_NAME = "social_monitor_session"
 OTP_LENGTH = 6
 OTP_REQUEST_COOLDOWN_SECONDS = 30
@@ -693,14 +694,25 @@ def save_auth_settings(settings):
 
 
 def load_auth_settings():
+    data = {}
+    loaded_from_runtime_file = False
     if os.path.exists(AUTH_SETTINGS_FILE):
         try:
             with open(AUTH_SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            loaded_from_runtime_file = True
         except Exception:
             data = {}
-    else:
-        data = {}
+
+    # Serverless fallback: when /tmp auth file is empty/new on another instance,
+    # read bundled auth settings (if present) to keep session secret/user policy stable.
+    if (not loaded_from_runtime_file) and os.path.exists(AUTH_SETTINGS_BUNDLE_FILE):
+        try:
+            with open(AUTH_SETTINGS_BUNDLE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+
     settings = normalize_auth_settings(data)
     if not os.path.exists(AUTH_SETTINGS_FILE):
         save_auth_settings(settings)
