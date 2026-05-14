@@ -521,8 +521,9 @@ def parse_bool_env(value: str, default: bool) -> bool:
     return default
 
 def build_default_auth_settings():
+    env_session_secret = str(os.getenv("AUTH_SESSION_SECRET", "") or "").strip()
     return {
-        "session_secret": secrets.token_hex(32),
+        "session_secret": env_session_secret or secrets.token_hex(32),
         "otp_ttl_seconds": 300,
         "session_ttl_seconds": 86400,
         "users": [],
@@ -679,7 +680,8 @@ def normalize_auth_settings(data):
     default_ssl = False if gmail_mode_enabled else mail["use_ssl"]
     mail["use_tls"] = parse_bool_env(os.getenv("AUTH_SMTP_USE_TLS", ""), default_tls)
     mail["use_ssl"] = parse_bool_env(os.getenv("AUTH_SMTP_USE_SSL", ""), default_ssl)
-    settings["session_secret"] = str(settings.get("session_secret", "") or "").strip() or secrets.token_hex(32)
+    env_session_secret = str(os.getenv("AUTH_SESSION_SECRET", "") or "").strip()
+    settings["session_secret"] = env_session_secret or str(settings.get("session_secret", "") or "").strip() or secrets.token_hex(32)
     return settings
 
 def save_auth_settings(settings):
@@ -1965,7 +1967,22 @@ def get_current_user(request: Optional[Request]):
         "role_label": "Admin" if user.get("role") == "admin" else "User",
     }
 
-def set_session_cookie(response, email: str):
+def should_use_secure_cookie(request: Optional[Request] = None) -> bool:
+    explicit = str(os.getenv("AUTH_COOKIE_SECURE", "") or "").strip().lower()
+    if explicit in {"1", "true", "yes", "on"}:
+        return True
+    if explicit in {"0", "false", "no", "off"}:
+        return False
+    if os.getenv("VERCEL", "").strip() or os.getenv("VERCEL_ENV", "").strip():
+        return True
+    if request is not None:
+        proto = str(request.headers.get("x-forwarded-proto", "") or "").strip().lower()
+        if proto == "https":
+            return True
+    return False
+
+
+def set_session_cookie(response, email: str, request: Optional[Request] = None):
     token = create_session_token(email)
     response.set_cookie(
         SESSION_COOKIE_NAME,
@@ -1973,7 +1990,7 @@ def set_session_cookie(response, email: str):
         max_age=int(get_auth_settings().get("session_ttl_seconds", 86400)),
         httponly=True,
         samesite="lax",
-        secure=False,
+        secure=should_use_secure_cookie(request),
         path="/",
     )
 
@@ -4051,38 +4068,67 @@ def get_gspread_client():
     ]
     service_account_json = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
     service_account_json_base64 = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_BASE64") or "").strip()
+    credential_errors = []
+
+    def _build_client_from_info(info: dict):
+        creds = Credentials.from_service_account_info(info, scopes=scopes)
+        return gspread.authorize(creds)
+
+    def _decode_service_account_base64(raw_value: str) -> dict:
+        # Accept pasted strings with spaces/newlines and both std/url-safe base64.
+        compact = re.sub(r"\s+", "", str(raw_value or ""))
+        if not compact:
+            raise ValueError("Chuỗi base64 rỗng.")
+        candidates = [compact]
+        padding = (-len(compact)) % 4
+        if padding:
+            candidates.append(compact + ("=" * padding))
+        decoders = (base64.b64decode, base64.urlsafe_b64decode)
+        last_error = None
+        for encoded in candidates:
+            for decoder in decoders:
+                try:
+                    decoded_text = decoder(encoded.encode("utf-8")).decode("utf-8")
+                    return json.loads(decoded_text)
+                except Exception as exc:
+                    last_error = exc
+        raise ValueError("Không giải mã được GOOGLE_SERVICE_ACCOUNT_JSON_BASE64.") from last_error
 
     if service_account_json:
         try:
             info = json.loads(service_account_json)
-            creds = Credentials.from_service_account_info(info, scopes=scopes)
-            return gspread.authorize(creds)
+            return _build_client_from_info(info)
         except Exception as exc:
-            raise ValueError(
-                "GOOGLE_SERVICE_ACCOUNT_JSON không hợp lệ. "
-                "Vui lòng dán nguyên JSON service account."
-            ) from exc
+            credential_errors.append(
+                "GOOGLE_SERVICE_ACCOUNT_JSON không hợp lệ (hãy dán nguyên JSON service account)."
+            )
 
     if service_account_json_base64:
         try:
-            decoded = base64.b64decode(service_account_json_base64).decode("utf-8")
-            info = json.loads(decoded)
-            creds = Credentials.from_service_account_info(info, scopes=scopes)
-            return gspread.authorize(creds)
+            # Common mistake: user pastes raw JSON into *_BASE64 env.
+            if service_account_json_base64.startswith("{"):
+                info = json.loads(service_account_json_base64)
+            else:
+                info = _decode_service_account_base64(service_account_json_base64)
+            return _build_client_from_info(info)
         except Exception as exc:
-            raise ValueError(
-                "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 không hợp lệ. "
-                "Vui lòng kiểm tra lại chuỗi base64."
-            ) from exc
+            credential_errors.append(
+                "GOOGLE_SERVICE_ACCOUNT_JSON_BASE64 không hợp lệ (kiểm tra lại encode base64 hoặc dùng GOOGLE_SERVICE_ACCOUNT_JSON)."
+            )
 
-    if not os.path.exists(SERVICE_ACCOUNT_FILE):
-        raise FileNotFoundError(
-            "Thiếu Google credentials. Hãy set GOOGLE_SERVICE_ACCOUNT_JSON "
-            "(hoặc GOOGLE_SERVICE_ACCOUNT_JSON_BASE64) trên môi trường deploy."
+    if os.path.exists(SERVICE_ACCOUNT_FILE):
+        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
+        return gspread.authorize(creds)
+
+    if credential_errors:
+        raise ValueError(
+            "Không đọc được Google credentials từ ENV. "
+            + " | ".join(credential_errors)
         )
-
-    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
-    return gspread.authorize(creds)
+    raise FileNotFoundError(
+        "Thiếu Google credentials. Hãy set GOOGLE_SERVICE_ACCOUNT_JSON "
+        "(hoặc GOOGLE_SERVICE_ACCOUNT_JSON_BASE64) trên môi trường deploy."
+    )
 
 def extract_sheet_id(sheet_input: str) -> Optional[str]:
     if not sheet_input:
@@ -6989,7 +7035,7 @@ async def auth_verify_otp(request: Request):
             "redirect_url": next_path,
         }
     )
-    set_session_cookie(response, email)
+    set_session_cookie(response, email, request)
     add_log(f"{mask_email(email)} đăng nhập với quyền {user.get('role', 'user')}")
     return response
 
@@ -15770,6 +15816,20 @@ def home(request: Request, background_tasks: BackgroundTasks):
                     "Đang ở trạng thái Đã dừng. Bấm Bắt đầu để mở lại rồi hãy nhập hoặc lưu sheet."
                 );
 
+                let refreshDashboardTimer = null;
+                let refreshAuthRedirectHandled = false;
+
+                const redirectToLoginFromStatus = () => {{
+                    if (refreshAuthRedirectHandled) return;
+                    refreshAuthRedirectHandled = true;
+                    if (refreshDashboardTimer) {{
+                        clearInterval(refreshDashboardTimer);
+                        refreshDashboardTimer = null;
+                    }}
+                    const nextPath = encodeURIComponent((window.location.pathname || "/") + (window.location.search || ""));
+                    window.location.href = `/login?next=${{nextPath}}`;
+                }};
+
                 const refreshDashboard = async () => {{
                     if (document.hidden || refreshInFlight) return;
                     refreshInFlight = true;
@@ -15778,8 +15838,16 @@ def home(request: Request, background_tasks: BackgroundTasks):
                             headers: {{ "X-Requested-With": "fetch" }},
                             cache: "no-store",
                         }});
+                        if (response.status === 401) {{
+                            redirectToLoginFromStatus();
+                            return;
+                        }}
                         if (!response.ok) return;
                         const data = await response.json();
+                        if (data && data.ok === false && /hết hạn|đăng nhập lại/i.test(String(data.message || ""))) {{
+                            redirectToLoginFromStatus();
+                            return;
+                        }}
                         applyStatusState(data);
                         applyActiveSheetMeta(data);
                         applyColumnConfigState(data);
@@ -16680,7 +16748,7 @@ def home(request: Request, background_tasks: BackgroundTasks):
 
                 // 3. Start polling
                 refreshDashboard();
-                setInterval(refreshDashboard, 2200);
+                refreshDashboardTimer = setInterval(refreshDashboard, 2200);
             }});
         </script>
     </head>
